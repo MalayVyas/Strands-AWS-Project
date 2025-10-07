@@ -1,11 +1,15 @@
 import os
 import io
-import asyncio
+import re
+import json
 import math
+import asyncio
+from typing import List, Dict, Any, Tuple
+
 import streamlit as st
 from dotenv import load_dotenv
 
-# Strands
+# Strands (generation via Gemini through LiteLLM)
 from strands import Agent
 from strands.models.litellm import LiteLLMModel
 
@@ -14,34 +18,43 @@ from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+# Gemini Embeddings (optional)
+try:
+    import google.generativeai as genai
+    HAS_GEM_EMB = True
+except Exception:
+    HAS_GEM_EMB = False
 
-st.set_page_config(page_title="Strands × Gemini PDF QA", page_icon="📄", layout="centered")
+
+# =========================
+# App setup
+# =========================
+st.set_page_config(page_title="Strands × Gemini — Multi-PDF QA", page_icon="📚", layout="wide")
 load_dotenv()
 
-
-# -----------------------------
-# Key resolution
-# -----------------------------
 def resolve_gemini_key() -> str:
     try:
-        key = st.secrets.get("GEMINI_API_KEY", None)
-        if not key:
-            key = st.secrets.get("GOOGLE_API_KEY", None)
+        key = st.secrets.get("GEMINI_API_KEY", None) or st.secrets.get("GOOGLE_API_KEY", None)
     except FileNotFoundError:
         key = None
     return key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
 
-
 GEMINI_API_KEY = resolve_gemini_key()
+if HAS_GEM_EMB and GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception:
+        pass  # handle at call time
 
 
-# -----------------------------
-# Sidebar: settings + PDF upload
-# -----------------------------
+# =========================
+# Sidebar: settings & data
+# =========================
 with st.sidebar:
     st.header("⚙️ Settings")
     if not GEMINI_API_KEY:
-        st.error("Missing GEMINI_API_KEY (or GOOGLE_API_KEY). Add to .env or .streamlit/secrets.toml.")
+        st.error("Missing GEMINI_API_KEY (or GOOGLE_API_KEY). Add it to .env or .streamlit/secrets.toml.")
+
     model_id = st.selectbox(
         "Gemini model (LiteLLM format)",
         [
@@ -52,159 +65,307 @@ with st.sidebar:
         index=0,
     )
     temperature = st.slider("Temperature", 0.0, 1.0, float(os.getenv("TEMPERATURE", "0.3")), 0.05)
+
     sys_prompt = st.text_area(
         "System prompt",
-        value="You answer using ONLY the provided PDF excerpts. If unsure, reply exactly: not sure.",
-        height=120,
+        value=(
+            "You answer using ONLY the provided PDF excerpts.\n"
+            "If the answer is not clearly present, reply exactly: not sure."
+        ),
+        height=130,
     )
 
     st.markdown("---")
-    st.subheader("📄 Load a PDF")
-    uploaded_pdf = st.file_uploader("Upload a PDF", type=["pdf"], accept_multiple_files=False)
+    st.subheader("📄 Upload PDFs")
+    uploaded_pdfs = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
 
-    st.caption("Tip: larger PDFs may take a few seconds to index on first load.")
+    st.caption("Tip: First index may take a few seconds per PDF.")
 
-    colA, colB = st.columns(2)
+    colA, colB, colC = st.columns(3)
     with colA:
         if st.button("🧹 Clear chat"):
             st.session_state.pop("messages", None)
             st.toast("Chat cleared.")
     with colB:
-        if st.button("♻️ Clear PDF index"):
-            for k in ("pdf_chunks", "pdf_vectorizer", "pdf_matrix", "pdf_name"):
+        if st.button("♻️ Clear all PDF indexes"):
+            for k in ("docs", "active_docs"):
                 st.session_state.pop(k, None)
-            st.toast("PDF index cleared.")
+            st.toast("PDF indexes cleared.")
+    with colC:
+        st.write("")  # spacer
+
+    st.markdown("---")
+    st.subheader("💾 Session")
+    # Download current chat
+    if "messages" in st.session_state and st.session_state.get("messages"):
+        export_json = json.dumps({"messages": st.session_state["messages"]}, ensure_ascii=False, indent=2)
+        st.download_button(
+            "⬇️ Download chat (JSON)",
+            data=export_json.encode("utf-8"),
+            file_name="chat_session.json",
+            mime="application/json",
+        )
+
+    # Load chat
+    load_file = st.file_uploader("Load chat (JSON)", type=["json"], accept_multiple_files=False, key="load_chat")
+    if load_file:
+        try:
+            loaded = json.loads(load_file.read().decode("utf-8"))
+            if isinstance(loaded, dict) and "messages" in loaded and isinstance(loaded["messages"], list):
+                st.session_state["messages"] = loaded["messages"]
+                st.toast("Chat loaded.")
+            else:
+                st.warning("Invalid chat JSON (expected {'messages': [...]}).")
+        except Exception as e:
+            st.error(f"Failed to load chat: {e}")
 
 
-st.title("📄 Strands × Gemini — Ask your PDF")
+st.title("📚 Strands × Gemini — Ask your PDFs")
 
-
-# -----------------------------
-# Session state
-# -----------------------------
+# =========================
+# State
+# =========================
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # [{"role": "user"/"assistant", "content": "..."}]
+    st.session_state.messages: List[Dict[str, str]] = []
 
+# docs: { doc_id: {name, chunks, pages, method, vectorizer?, matrix, emb? } }
+if "docs" not in st.session_state:
+    st.session_state.docs: Dict[str, Dict[str, Any]] = {}
 
-# -----------------------------
-# PDF helpers
-# -----------------------------
-def extract_pdf_text(file_bytes: bytes) -> str:
-    """Extract text from a PDF (very simple; no layout reconstruction)."""
-    txt = []
+# active_docs: set of doc_ids to include in retrieval
+if "active_docs" not in st.session_state:
+    st.session_state.active_docs = set()
+
+# =========================
+# PDF processing
+# =========================
+def extract_pdf_pages(file_bytes: bytes) -> List[str]:
+    """Return a list of page texts (index = page_number)."""
     reader = PdfReader(io.BytesIO(file_bytes))
+    pages = []
     for page in reader.pages:
-        # 'extract_text' returns a string, sometimes with newlines
-        txt.append(page.extract_text() or "")
-    return "\n".join(txt)
+        pages.append(page.extract_text() or "")
+    return pages
 
-
-def chunk_text(text: str, chunk_chars: int = 1200, overlap: int = 200) -> list[str]:
+def chunk_pages(pages: List[str], chunk_chars: int = 1200, overlap: int = 200) -> Tuple[List[str], List[int]]:
     """
-    Dumb but effective chunking by characters, with overlap.
-    Keeps context near boundaries and avoids extra deps.
+    Chunk page texts with overlap; return (chunks, page_numbers).
+    Keeps page provenance for display.
     """
-    text = text.replace("\r", "")
-    n = len(text)
-    chunks = []
-    i = 0
-    while i < n:
-        chunk = text[i : i + chunk_chars]
-        chunks.append(chunk.strip())
-        i += chunk_chars - overlap
-        if i < 0 or i >= n:
-            break
-    # Filter very short chunks
-    return [c for c in chunks if len(c) > 20]
+    chunks, owners = [], []
+    for pno, page_text in enumerate(pages, start=1):
+        t = (page_text or "").replace("\r", "")
+        n, i = len(t), 0
+        while i < n:
+            chunk = t[i : i + chunk_chars].strip()
+            if len(chunk) > 20:
+                chunks.append(chunk)
+                owners.append(pno)
+            i += chunk_chars - overlap
+            if i < 0 or i >= n:
+                break
+    return chunks, owners
 
-
-def ensure_pdf_index(file, force=False):
+# =========================
+# Embeddings & TF-IDF
+# =========================
+def embed_texts_gemini(texts: List[str]) -> List[List[float]]:
     """
-    Build TF-IDF index for the uploaded PDF and cache it in session state.
+    Embed a list of strings using Gemini text-embedding-004.
+    Returns list of embedding vectors.
     """
-    if not file:
-        return
+    if not (HAS_GEM_EMB and GEMINI_API_KEY):
+        raise RuntimeError("Gemini embeddings not available")
 
-    name_changed = st.session_state.get("pdf_name") != file.name
-    if "pdf_chunks" in st.session_state and not (force or name_changed):
-        return  # already indexed this file
+    model_name = "models/text-embedding-004"  # gemini API naming
+    vecs: List[List[float]] = []
+    for t in texts:
+        t = t or ""
+        try:
+            out = genai.embed_content(model=model_name, content=t)
+            vecs.append(out["embedding"])
+        except Exception as e:
+            # Fail fast; caller will fallback to TF-IDF
+            raise e
+    return vecs
 
-    # Read file and build chunks
-    file_bytes = file.read()
-    text = extract_pdf_text(file_bytes)
-    chunks = chunk_text(text)
+def ensure_doc_index(doc_id: str, name: str, file_bytes: bytes):
+    """
+    Build (or rebuild) the index for a single PDF:
+      - preferred: Gemini embeddings
+      - fallback: TF-IDF
+    Saves into st.session_state.docs[doc_id]
+    """
+    pages = extract_pdf_pages(file_bytes)
+    chunks, owners = chunk_pages(pages)
 
     if not chunks:
-        st.warning("Could not extract any text from the PDF.")
+        st.warning(f"No text extracted from: {name}")
         return
 
-    # Build TF-IDF vectors for chunks
-    vectorizer = TfidfVectorizer(
-        strip_accents="unicode",
-        lowercase=True,
-        stop_words="english",
-        max_features=50_000,
-        ngram_range=(1, 2),
+    # Try embeddings first
+    use_embeddings = False
+    emb_matrix = None
+    vectorizer = None
+    tfidf_matrix = None
+    method = "tfidf"
+
+    try:
+        vecs = embed_texts_gemini(chunks)
+        # Convert to a simple (n, d) list-of-lists; we'll cosine against it with sklearn
+        # You can also use numpy arrays if preferred
+        import numpy as np
+        emb_matrix = np.array(vecs, dtype="float32")
+        use_embeddings = True
+        method = "emb"
+    except Exception:
+        # fall back to TF-IDF
+        vectorizer = TfidfVectorizer(
+            strip_accents="unicode",
+            lowercase=True,
+            stop_words="english",
+            max_features=50_000,
+            ngram_range=(1, 2),
+        )
+        tfidf_matrix = vectorizer.fit_transform(chunks)
+
+    st.session_state.docs[doc_id] = {
+        "name": name,
+        "chunks": chunks,
+        "pages": owners,
+        "method": method,
+        "emb_matrix": emb_matrix,
+        "vectorizer": vectorizer,
+        "tfidf_matrix": tfidf_matrix,
+    }
+    st.session_state.active_docs.add(doc_id)
+
+def maybe_index_new_uploads(files: List[Any]):
+    """Index any newly uploaded PDFs."""
+    if not files:
+        return
+    for f in files:
+        doc_id = f"{f.name}|{f.size}"
+        if doc_id not in st.session_state.docs:
+            ensure_doc_index(doc_id, f.name, f.read())
+
+maybe_index_new_uploads(uploaded_pdfs)
+
+# =========================
+# Per-document toggles
+# =========================
+if st.session_state.docs:
+    st.subheader("Included documents")
+    doc_labels = []
+    for did, meta in st.session_state.docs.items():
+        label = f"{meta['name']}  ·  {len(meta['chunks'])} chunks  ·  method: {meta['method']}"
+        doc_labels.append((did, label))
+
+    default_selection = [did for did, _ in doc_labels if did in st.session_state.active_docs]
+    selection = st.multiselect(
+        "Choose which documents to include in retrieval:",
+        options=[did for did, _ in doc_labels],
+        format_func=lambda did: dict(doc_labels)[did],
+        default=default_selection,
     )
-    matrix = vectorizer.fit_transform(chunks)
+    st.session_state.active_docs = set(selection)
 
-    st.session_state.pdf_chunks = chunks
-    st.session_state.pdf_vectorizer = vectorizer
-    st.session_state.pdf_matrix = matrix
-    st.session_state.pdf_name = file.name
+# =========================
+# Retrieval
+# =========================
+def cosine_sim_dense(query_vec, doc_matrix):
+    # query_vec: (d,), doc_matrix: (n, d)
+    import numpy as np
+    a = doc_matrix @ query_vec  # (n,)
+    denom = (np.linalg.norm(doc_matrix, axis=1) * (np.linalg.norm(query_vec) + 1e-12)) + 1e-12
+    return a / denom
 
-
-def retrieve_context(question: str, k: int = 5) -> tuple[str, list[int]]:
+def highlight_snippet(text: str, query: str, window: int = 420) -> str:
     """
-    Return a context string with the top-k most similar chunks and their indices.
+    Return a shortened snippet with simple query-term highlighting.
+    Bold words >=3 chars that appear in the query.
     """
-    if "pdf_matrix" not in st.session_state:
+    words = [w for w in re.findall(r"[A-Za-z0-9]+", query.lower()) if len(w) >= 3]
+    if not words:
+        snippet = text[:window]
+    else:
+        # Find first occurrence of any word, center window around it
+        loc = min((text.lower().find(w) for w in words if text.lower().find(w) != -1), default=-1)
+        if loc == -1:
+            snippet = text[:window]
+        else:
+            start = max(0, loc - window // 2)
+            snippet = text[start : start + window]
+
+    # Bold matches
+    def repl(m):
+        return f"**{m.group(0)}**"
+    for w in sorted(set(words), key=len, reverse=True):
+        snippet = re.sub(fr"(?i)\b({re.escape(w)})\b", repl, snippet)
+    return snippet.strip()
+
+def retrieve(question: str, k_total: int = 6) -> Tuple[str, List[Tuple[str, int, float]]]:
+    """
+    Search across all active docs, return a context string and provenance:
+    provenance items: (doc_name, page_no, score)
+    """
+    if not st.session_state.active_docs:
         return "", []
 
-    vectorizer = st.session_state.pdf_vectorizer
-    matrix = st.session_state.pdf_matrix
-    chunks = st.session_state.pdf_chunks
+    hits: List[Tuple[str, int, float, str]] = []  # (doc_id, chunk_idx, score, snippet)
+    for did in st.session_state.active_docs:
+        meta = st.session_state.docs[did]
+        chunks, pages, method = meta["chunks"], meta["pages"], meta["method"]
 
-    q_vec = vectorizer.transform([question])
-    scores = cosine_similarity(q_vec, matrix).ravel()
-    order = scores.argsort()[::-1][:k]
+        if method == "emb" and meta["emb_matrix"] is not None:
+            # Embed question
+            try:
+                qv = embed_texts_gemini([question])[0]  # list[float]
+                import numpy as np
+                qv = np.array(qv, dtype="float32")
+                scores = cosine_sim_dense(qv, meta["emb_matrix"])
+            except Exception:
+                # embeddings down? fallback to TF-IDF on the fly
+                vect = TfidfVectorizer(strip_accents="unicode", lowercase=True, stop_words="english", max_features=50_000, ngram_range=(1,2))
+                mat = vect.fit_transform(chunks)
+                scores = cosine_similarity(vect.transform([question]), mat).ravel()
+        else:
+            vect = meta["vectorizer"]
+            mat = meta["tfidf_matrix"]
+            if vect is None or mat is None:
+                # Shouldn't happen, but guard
+                vect = TfidfVectorizer(strip_accents="unicode", lowercase=True, stop_words="english", max_features=50_000, ngram_range=(1,2))
+                mat = vect.fit_transform(chunks)
+            scores = cosine_similarity(vect.transform([question]), mat).ravel()
 
-    excerpts = []
-    for rank, idx in enumerate(order, start=1):
-        score = scores[idx]
-        excerpt = chunks[idx]
-        header = f"[{rank}] (score={score:.3f})"
-        excerpts.append(f"{header}\n{excerpt}")
+        # Take top 4 per-doc, we’ll merge globally later
+        top_idx = scores.argsort()[::-1][:4]
+        for idx in top_idx:
+            snippet = highlight_snippet(chunks[idx], question)
+            hits.append((did, idx, float(scores[idx]), snippet))
 
-    context = f"PDF: {st.session_state.get('pdf_name','(uploaded)')}\n\n" + "\n\n-----\n\n".join(excerpts)
-    return context, order.tolist()
+    # Global top-k
+    hits.sort(key=lambda x: x[2], reverse=True)
+    hits = hits[:k_total]
 
+    # Build context block with provenance
+    blocks = []
+    provenance: List[Tuple[str, int, float]] = []
+    for rank, (did, idx, score, snippet) in enumerate(hits, start=1):
+        meta = st.session_state.docs[did]
+        name = meta["name"]
+        page_no = meta["pages"][idx]
+        provenance.append((name, page_no, score))
+        blocks.append(
+            f"[{rank}] {name} — p.{page_no} (score={score:.3f})\n{snippet}"
+        )
 
-# -----------------------------
-# Build Strands Agent (LiteLLM → Gemini)
-# -----------------------------
-litellm_model = LiteLLMModel(
-    client_args={"api_key": GEMINI_API_KEY},
-    model_id=model_id,  # e.g., "gemini/gemini-2.0-flash"
-    params={"temperature": temperature},
-)
+    context = "=== RETRIEVED EXCERPTS ===\n" + "\n\n-----\n\n".join(blocks) if blocks else ""
+    return context, provenance
 
-agent = Agent(
-    model=litellm_model,
-    system_prompt=sys_prompt,  # keep system-level policy here
-)
-
-
-# -----------------------------
-# Chat utilities
-# -----------------------------
-def to_strands_messages(history: list[dict]) -> list[dict]:
-    """
-    Convert [{'role': 'user'|'assistant', 'content': str}, ...] to Strands Messages:
-      { "role": "user"|"assistant", "content": [ {"text": "..."} ] }
-    Drops blanks & coerces content to strings.
-    """
-    msgs: list[dict] = []
+def to_strands_messages(history: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Convert to Strands schema: {role, content:[{text}]} and drop blanks."""
+    msgs: List[Dict[str, Any]] = []
     for m in history:
         role = (m.get("role") or "").lower()
         content = m.get("content")
@@ -218,31 +379,31 @@ def to_strands_messages(history: list[dict]) -> list[dict]:
             msgs.append({"role": role, "content": [{"text": content}]})
     return msgs
 
-
-def build_rag_prompt(question: str, context: str) -> str:
-    """
-    Create a single user message combining the PDF context + question.
-    The system prompt already says to only use provided excerpts.
-    """
-    return (
-        "You are given PDF excerpts below. Use ONLY these to answer.\n"
-        "If the answer isn't clearly contained, reply exactly: not sure.\n\n"
-        f"=== PDF EXCERPTS START ===\n{context}\n=== PDF EXCERPTS END ===\n\n"
-        f"Question: {question}"
+def build_rag_user_message(question: str, context: str) -> Dict[str, Any]:
+    """Single user turn containing context + question."""
+    text = (
+        "Use ONLY the excerpts below to answer.\n"
+        "If the answer isn't clearly present, reply exactly: not sure.\n\n"
+        f"{context}\n\nQuestion: {question}"
     )
+    return {"role": "user", "content": [{"text": text}]}
 
+# =========================
+# Strands agent
+# =========================
+litellm_model = LiteLLMModel(
+    client_args={"api_key": GEMINI_API_KEY},
+    model_id=model_id,
+    params={"temperature": temperature},
+)
 
-def run_agent(messages: list[dict]) -> str:
-    """Non-streaming fallback."""
+agent = Agent(model=litellm_model, system_prompt=sys_prompt)
+
+def run_agent(messages: List[Dict[str, Any]]) -> str:
     res = agent(messages)
     return getattr(res, "text", str(res))
 
-
-async def stream_agent(messages: list[dict], write_fn) -> str:
-    """
-    Stream tokens from Strands async iterator.
-    Normalizes event payloads to incremental text updates.
-    """
+async def stream_agent(messages: List[Dict[str, Any]], write_fn) -> str:
     acc = ""
     async for event in agent.stream_async(messages):
         data = None
@@ -255,48 +416,33 @@ async def stream_agent(messages: list[dict], write_fn) -> str:
             write_fn(acc)
     return acc
 
-
-# -----------------------------
-# Render history
-# -----------------------------
+# =========================
+# Chat UI
+# =========================
+# Show history
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# Build / refresh the PDF index if a file was provided
-ensure_pdf_index(uploaded_pdf)
+# Input row
+user_input = st.chat_input("Ask a question about your selected PDFs (or chat normally)…")
 
-# Chat input
-user_input = st.chat_input("Ask a question about the uploaded PDF (or chat normally)…")
-
-
-# -----------------------------
-# Handle new user message
-# -----------------------------
+# Handle user message
 if user_input:
-    # Show user turn
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # If we have a PDF index, do retrieval and inject context;
-    # otherwise, just pass through the normal history.
-    have_pdf = "pdf_matrix" in st.session_state
-    if have_pdf:
-        context, hits = retrieve_context(user_input, k=5)
-        # Compose payload: prior history (excluding this last user),
-        # then a single user message that includes context + question.
+    have_docs = bool(st.session_state.active_docs)
+    if have_docs:
+        context, prov = retrieve(user_input, k_total=6)
         prior = st.session_state.messages[:-1]
         prior_payload = to_strands_messages(prior)
-        augmented_user = {
-            "role": "user",
-            "content": [{"text": build_rag_prompt(user_input, context)}],
-        }
-        payload = [*prior_payload, augmented_user]
+        augmented = build_rag_user_message(user_input, context if context else "(no excerpts)")
+        payload = [*prior_payload, augmented]
     else:
         payload = to_strands_messages(st.session_state.messages)
 
-    # Stream model response
     with st.chat_message("assistant"):
         placeholder = st.empty()
         try:
@@ -308,13 +454,12 @@ if user_input:
             answer = f"⚠️ Error: {e}"
             placeholder.markdown(answer)
 
-    # Append assistant turn
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
-    # (Optional) Tiny provenance footer when using PDF context
-    if have_pdf and isinstance(answer, str) and answer.strip():
-        with st.expander("🔎 Context used (top matches)"):
+    # Context/provenance panel
+    if have_docs and isinstance(answer, str) and answer.strip():
+        with st.expander("🔎 Context used (top excerpts with page numbers)"):
             st.markdown(
-                "The answer above was generated using the most similar excerpts from the uploaded PDF."
+                "The answer above was generated **only** from the following excerpts."
             )
-            st.code(context[:5000])  # avoid overly long UI blocks
+            st.code(context[:8000])

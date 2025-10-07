@@ -5,3 +5,4 @@ strands-agents
 strands-agents-tools
 pypdf
 scikit-learn
+google-generativeai
