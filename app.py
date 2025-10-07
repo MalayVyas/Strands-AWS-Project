@@ -2,7 +2,6 @@ import os
 import io
 import re
 import json
-import math
 import asyncio
 from typing import List, Dict, Any, Tuple
 
@@ -44,7 +43,7 @@ if HAS_GEM_EMB and GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
     except Exception:
-        pass  # handle at call time
+        pass  # we'll handle at call time
 
 
 # =========================
@@ -66,11 +65,21 @@ with st.sidebar:
     )
     temperature = st.slider("Temperature", 0.0, 1.0, float(os.getenv("TEMPERATURE", "0.3")), 0.05)
 
+    # NEW: response-length controls
+    style = st.radio("Answer style", ["Concise", "Detailed"], index=1, horizontal=True)
+    target_words = st.slider("Target length (words)", 100, 1500, 600, 50)
+    max_gen_tokens = st.slider(
+        "Max output tokens",
+        256, 4096, 1500, 64,
+        help="Hard cap on model output length (used for both generic and Gemini-specific params)."
+    )
+
     sys_prompt = st.text_area(
         "System prompt",
         value=(
-            "You answer using ONLY the provided PDF excerpts.\n"
-            "If the answer is not clearly present, reply exactly: not sure."
+            "You are a helpful assistant. Prefer clarity and completeness.\n"
+            "Use ONLY the provided excerpts when present. If the answer "
+            "is not clearly present, reply exactly: not sure."
         ),
         height=130,
     )
@@ -78,7 +87,6 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("📄 Upload PDFs")
     uploaded_pdfs = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
-
     st.caption("Tip: First index may take a few seconds per PDF.")
 
     colA, colB, colC = st.columns(3)
@@ -128,13 +136,14 @@ st.title("📚 Strands × Gemini — Ask your PDFs")
 if "messages" not in st.session_state:
     st.session_state.messages: List[Dict[str, str]] = []
 
-# docs: { doc_id: {name, chunks, pages, method, vectorizer?, matrix, emb? } }
+# docs: { doc_id: {name, chunks, pages, method, vectorizer?, matrix?, emb_matrix? } }
 if "docs" not in st.session_state:
     st.session_state.docs: Dict[str, Dict[str, Any]] = {}
 
 # active_docs: set of doc_ids to include in retrieval
 if "active_docs" not in st.session_state:
     st.session_state.active_docs = set()
+
 
 # =========================
 # PDF processing
@@ -147,7 +156,7 @@ def extract_pdf_pages(file_bytes: bytes) -> List[str]:
         pages.append(page.extract_text() or "")
     return pages
 
-def chunk_pages(pages: List[str], chunk_chars: int = 1200, overlap: int = 200) -> Tuple[List[str], List[int]]:
+def chunk_pages(pages: List[str], chunk_chars: int = 1500, overlap: int = 250) -> Tuple[List[str], List[int]]:
     """
     Chunk page texts with overlap; return (chunks, page_numbers).
     Keeps page provenance for display.
@@ -166,6 +175,7 @@ def chunk_pages(pages: List[str], chunk_chars: int = 1200, overlap: int = 200) -
                 break
     return chunks, owners
 
+
 # =========================
 # Embeddings & TF-IDF
 # =========================
@@ -177,16 +187,12 @@ def embed_texts_gemini(texts: List[str]) -> List[List[float]]:
     if not (HAS_GEM_EMB and GEMINI_API_KEY):
         raise RuntimeError("Gemini embeddings not available")
 
-    model_name = "models/text-embedding-004"  # gemini API naming
+    model_name = "models/text-embedding-004"  # Gemini embeddings model name
     vecs: List[List[float]] = []
     for t in texts:
         t = t or ""
-        try:
-            out = genai.embed_content(model=model_name, content=t)
-            vecs.append(out["embedding"])
-        except Exception as e:
-            # Fail fast; caller will fallback to TF-IDF
-            raise e
+        out = genai.embed_content(model=model_name, content=t)
+        vecs.append(out["embedding"])
     return vecs
 
 def ensure_doc_index(doc_id: str, name: str, file_bytes: bytes):
@@ -203,7 +209,6 @@ def ensure_doc_index(doc_id: str, name: str, file_bytes: bytes):
         st.warning(f"No text extracted from: {name}")
         return
 
-    # Try embeddings first
     use_embeddings = False
     emb_matrix = None
     vectorizer = None
@@ -211,15 +216,14 @@ def ensure_doc_index(doc_id: str, name: str, file_bytes: bytes):
     method = "tfidf"
 
     try:
+        # Try embeddings first
         vecs = embed_texts_gemini(chunks)
-        # Convert to a simple (n, d) list-of-lists; we'll cosine against it with sklearn
-        # You can also use numpy arrays if preferred
         import numpy as np
         emb_matrix = np.array(vecs, dtype="float32")
         use_embeddings = True
         method = "emb"
     except Exception:
-        # fall back to TF-IDF
+        # Fall back to TF-IDF
         vectorizer = TfidfVectorizer(
             strip_accents="unicode",
             lowercase=True,
@@ -240,7 +244,7 @@ def ensure_doc_index(doc_id: str, name: str, file_bytes: bytes):
     }
     st.session_state.active_docs.add(doc_id)
 
-def maybe_index_new_uploads(files: List[Any]):
+def maybe_index_new_uploads(files):
     """Index any newly uploaded PDFs."""
     if not files:
         return
@@ -250,6 +254,7 @@ def maybe_index_new_uploads(files: List[Any]):
             ensure_doc_index(doc_id, f.name, f.read())
 
 maybe_index_new_uploads(uploaded_pdfs)
+
 
 # =========================
 # Per-document toggles
@@ -270,6 +275,7 @@ if st.session_state.docs:
     )
     st.session_state.active_docs = set(selection)
 
+
 # =========================
 # Retrieval
 # =========================
@@ -280,17 +286,19 @@ def cosine_sim_dense(query_vec, doc_matrix):
     denom = (np.linalg.norm(doc_matrix, axis=1) * (np.linalg.norm(query_vec) + 1e-12)) + 1e-12
     return a / denom
 
-def highlight_snippet(text: str, query: str, window: int = 420) -> str:
+def highlight_snippet(text: str, query: str, window: int = 520) -> str:
     """
     Return a shortened snippet with simple query-term highlighting.
     Bold words >=3 chars that appear in the query.
     """
     words = [w for w in re.findall(r"[A-Za-z0-9]+", query.lower()) if len(w) >= 3]
+    text_lower = text.lower()
+
     if not words:
         snippet = text[:window]
     else:
-        # Find first occurrence of any word, center window around it
-        loc = min((text.lower().find(w) for w in words if text.lower().find(w) != -1), default=-1)
+        locs = [text_lower.find(w) for w in words if text_lower.find(w) != -1]
+        loc = min(locs) if locs else -1
         if loc == -1:
             snippet = text[:window]
         else:
@@ -317,7 +325,7 @@ def retrieve(question: str, k_total: int = 6) -> Tuple[str, List[Tuple[str, int,
         meta = st.session_state.docs[did]
         chunks, pages, method = meta["chunks"], meta["pages"], meta["method"]
 
-        if method == "emb" and meta["emb_matrix"] is not None:
+        if method == "emb" and meta["emb_matrix" ] is not None:
             # Embed question
             try:
                 qv = embed_texts_gemini([question])[0]  # list[float]
@@ -333,12 +341,12 @@ def retrieve(question: str, k_total: int = 6) -> Tuple[str, List[Tuple[str, int,
             vect = meta["vectorizer"]
             mat = meta["tfidf_matrix"]
             if vect is None or mat is None:
-                # Shouldn't happen, but guard
+                # guard fallback
                 vect = TfidfVectorizer(strip_accents="unicode", lowercase=True, stop_words="english", max_features=50_000, ngram_range=(1,2))
                 mat = vect.fit_transform(chunks)
             scores = cosine_similarity(vect.transform([question]), mat).ravel()
 
-        # Take top 4 per-doc, we’ll merge globally later
+        # Take top 4 per-doc; merge globally later
         top_idx = scores.argsort()[::-1][:4]
         for idx in top_idx:
             snippet = highlight_snippet(chunks[idx], question)
@@ -356,12 +364,11 @@ def retrieve(question: str, k_total: int = 6) -> Tuple[str, List[Tuple[str, int,
         name = meta["name"]
         page_no = meta["pages"][idx]
         provenance.append((name, page_no, score))
-        blocks.append(
-            f"[{rank}] {name} — p.{page_no} (score={score:.3f})\n{snippet}"
-        )
+        blocks.append(f"[{rank}] {name} — p.{page_no} (score={score:.3f})\n{snippet}")
 
     context = "=== RETRIEVED EXCERPTS ===\n" + "\n\n-----\n\n".join(blocks) if blocks else ""
     return context, provenance
+
 
 def to_strands_messages(history: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     """Convert to Strands schema: {role, content:[{text}]} and drop blanks."""
@@ -379,14 +386,21 @@ def to_strands_messages(history: List[Dict[str, str]]) -> List[Dict[str, Any]]:
             msgs.append({"role": role, "content": [{"text": content}]})
     return msgs
 
-def build_rag_user_message(question: str, context: str) -> Dict[str, Any]:
-    """Single user turn containing context + question."""
+def build_rag_user_message(question: str, context: str, style: str, target_words: int) -> Dict[str, Any]:
+    """Single user turn containing context + question with length/style guidance."""
+    detail_instr = (
+        f"Write a {'brief' if style=='Concise' else 'comprehensive'} answer. "
+        f"Target ~{target_words} words. Use clear structure "
+        f"({'bullet points' if style=='Concise' else 'paragraphs + bullet points'}). "
+        "Cite page numbers inline like (p.12)."
+    )
     text = (
-        "Use ONLY the excerpts below to answer.\n"
-        "If the answer isn't clearly present, reply exactly: not sure.\n\n"
+        "Use ONLY the excerpts below to answer. If the answer isn't clearly present, reply exactly: not sure.\n\n"
+        f"{detail_instr}\n\n"
         f"{context}\n\nQuestion: {question}"
     )
     return {"role": "user", "content": [{"text": text}]}
+
 
 # =========================
 # Strands agent
@@ -394,7 +408,11 @@ def build_rag_user_message(question: str, context: str) -> Dict[str, Any]:
 litellm_model = LiteLLMModel(
     client_args={"api_key": GEMINI_API_KEY},
     model_id=model_id,
-    params={"temperature": temperature},
+    params={
+        "temperature": temperature,
+        "max_tokens": int(max_gen_tokens),          # generic cap
+        "max_output_tokens": int(max_gen_tokens),   # Gemini-specific cap
+    },
 )
 
 agent = Agent(model=litellm_model, system_prompt=sys_prompt)
@@ -416,6 +434,7 @@ async def stream_agent(messages: List[Dict[str, Any]], write_fn) -> str:
             write_fn(acc)
     return acc
 
+
 # =========================
 # Chat UI
 # =========================
@@ -423,6 +442,12 @@ async def stream_agent(messages: List[Dict[str, Any]], write_fn) -> str:
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
+
+# Build / refresh the PDF indexes if provided
+if uploaded_pdfs:
+    # Note: file_uploader returns UploadedFile objects; .read() is consumed,
+    # so we read during indexing.
+    pass  # already handled in maybe_index_new_uploads()
 
 # Input row
 user_input = st.chat_input("Ask a question about your selected PDFs (or chat normally)…")
@@ -435,10 +460,12 @@ if user_input:
 
     have_docs = bool(st.session_state.active_docs)
     if have_docs:
-        context, prov = retrieve(user_input, k_total=6)
+        # more context for Detailed answers
+        k_total = 10 if style == "Detailed" else 6
+        context, prov = retrieve(user_input, k_total=k_total)
         prior = st.session_state.messages[:-1]
         prior_payload = to_strands_messages(prior)
-        augmented = build_rag_user_message(user_input, context if context else "(no excerpts)")
+        augmented = build_rag_user_message(user_input, context if context else "(no excerpts)", style, target_words)
         payload = [*prior_payload, augmented]
     else:
         payload = to_strands_messages(st.session_state.messages)
@@ -459,7 +486,5 @@ if user_input:
     # Context/provenance panel
     if have_docs and isinstance(answer, str) and answer.strip():
         with st.expander("🔎 Context used (top excerpts with page numbers)"):
-            st.markdown(
-                "The answer above was generated **only** from the following excerpts."
-            )
+            st.markdown("The answer above was generated **only** from the following excerpts.")
             st.code(context[:8000])
